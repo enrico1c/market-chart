@@ -53,6 +53,7 @@
     .ok   { color:#26a69a; }
     .err  { color:#ef5350; }
     .warn { color:#f57c00; }
+    .cache{ color:#7c4dff; }
   </style>
 </head>
 <body>
@@ -81,8 +82,8 @@
 </div>
 
 <div class="statusbar">
-  <span>Src 1 (historical): <span id="s1">&mdash;</span></span>
-  <span>Src 2 (gap fill):   <span id="s2">&mdash;</span></span>
+  <span>Src 1: <span id="s1">&mdash;</span></span>
+  <span>Src 2 (gap): <span id="s2">&mdash;</span></span>
   <span>Live: <span id="sLive">&mdash;</span></span>
   <span class="right" id="sTime">&mdash;</span>
 </div>
@@ -91,20 +92,20 @@
 // ═══════════════════════════════════════════════════════════
 //  CONFIG
 // ═══════════════════════════════════════════════════════════
-var LAG_MIN    = 10;
-var CORS_PROXY = 'https://corsproxy.io/?';
+var LAG_MIN   = 10;
+var CACHE_TTL = 5 * 60 * 1000;   // 5 minutes — candles served from localStorage
 
-// How many bars to show per interval (crypto uses pagination to exceed 1000)
+// Bars to fetch per interval (crypto paginates to exceed 1000)
 var HIST_BARS = {
-  '1m' : 2880,   // 2 days  (3 Binance pages)
-  '5m' : 1440,   // 5 days  (2 pages)
-  '15m': 960,    // 10 days (1 page)
-  '30m': 720,    // 15 days (1 page)
-  '1h' : 500,    // ~21 days
-  '4h' : 500,    // ~83 days
-  '1d' : 500,    // ~500 days
-  '1w' : 200,    // ~4 years
+  '1m':2880,'5m':1440,'15m':960,'30m':720,
+  '1h':500,'4h':500,'1d':500,'1w':200
 };
+
+// CORS proxy fallback chain for stock/forex requests
+var CORS_PROXIES = [
+  'https://corsproxy.io/?',
+  'https://api.allorigins.win/raw?url='
+];
 
 // ═══════════════════════════════════════════════════════════
 //  INTERVAL TABLES
@@ -117,11 +118,15 @@ var IV_BINANCE = {
   '1m':'1m','5m':'5m','15m':'15m','30m':'30m',
   '1h':'1h','4h':'4h','1d':'1d','1w':'1w'
 };
+// Bybit uses numeric minutes except D/W
+var IV_BYBIT = {
+  '1m':'1','5m':'5','15m':'15','30m':'30',
+  '1h':'60','4h':'240','1d':'D','1w':'W'
+};
 var IV_KRAKEN = {
   '1m':1,'5m':5,'15m':15,'30m':30,
   '1h':60,'4h':240,'1d':1440,'1w':10080
 };
-// Yahoo has no native 4h — fetch 1h and aggregate
 var IV_YAHOO = {
   '1m':'1m','5m':'5m','15m':'15m','30m':'30m',
   '1h':'60m','4h':'60m','1d':'1d','1w':'1wk'
@@ -146,70 +151,220 @@ var KRAKEN_MAP = {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  ASSET TYPE DETECTION
+//  ASSET DETECTION
 // ═══════════════════════════════════════════════════════════
 function isCrypto(raw) {
-  var s = raw.toUpperCase().replace(/[\s\/\-_]/g, '');
+  var s = raw.toUpperCase().replace(/[\s\/\-_]/g,'');
   if (/^(EURUSD|GBPUSD|USDJPY|AUDUSD|USDCHF|NZDUSD|USDCAD)/.test(s)) return false;
   return /^[A-Z0-9]+(USDT|USDC|BUSD|BTC|ETH|BNB)$/.test(s);
 }
-
 function normalizeBinance(raw) {
-  return raw.toUpperCase().replace(/[\s\/\-_]/g, '');
+  return raw.toUpperCase().replace(/[\s\/\-_]/g,'');
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SOURCE 1 — BINANCE REST with pagination
-//  Binance caps at 1000 candles per call — we loop to fill HIST_BARS
+//  LOCALSTORAGE CACHE  (eliminates redundant API calls)
 // ═══════════════════════════════════════════════════════════
-async function fetchBinanceHist(symbol, interval, startMs, endMs) {
-  var iv       = IV_BINANCE[interval] || '1h';
-  var all      = [];
-  var batchEnd = endMs;
+function cacheKey(symbol, interval) {
+  return 'chart_' + symbol + '_' + interval;
+}
+function saveCache(symbol, interval, candles) {
+  try {
+    localStorage.setItem(cacheKey(symbol, interval),
+      JSON.stringify({ ts: Date.now(), d: candles }));
+  } catch(e) {}
+}
+function loadCache(symbol, interval) {
+  try {
+    var raw = localStorage.getItem(cacheKey(symbol, interval));
+    if (!raw) return null;
+    var obj = JSON.parse(raw);
+    if (Date.now() - obj.ts > CACHE_TTL) return null;
+    return obj.d;
+  } catch(e) { return null; }
+}
 
-  // Walk backward in 1000-candle batches until we reach startMs
-  while (batchEnd > startMs) {
-    var url = 'https://api.binance.com/api/v3/klines' +
-      '?symbol=' + symbol + '&interval=' + iv +
-      '&startTime=' + startMs + '&endTime=' + batchEnd + '&limit=1000';
-    var res = await fetch(url);
-    if (!res.ok) throw new Error('Binance HTTP ' + res.status);
-    var rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) break;
+// ═══════════════════════════════════════════════════════════
+//  GENERIC HELPERS
+// ═══════════════════════════════════════════════════════════
 
-    var batch = rows.map(function(k) {
-      return { time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] };
-    });
-
-    // Prepend batch (we're walking backwards)
-    all = batch.concat(all);
-
-    // If we got fewer than 1000 rows we've reached the start
-    if (rows.length < 1000) break;
-
-    // Move the window back: next batch ends just before the earliest candle we got
-    batchEnd = rows[0][0] - 1;
+// Fetch through CORS proxy chain — tries each proxy in order
+async function proxyFetch(url) {
+  var last;
+  for (var i = 0; i < CORS_PROXIES.length; i++) {
+    try {
+      var res = await fetch(CORS_PROXIES[i] + encodeURIComponent(url));
+      if (res.ok) return res;
+      last = new Error('HTTP ' + res.status + ' via proxy ' + i);
+    } catch(e) { last = e; }
   }
+  throw last || new Error('All CORS proxies failed');
+}
 
-  // Deduplicate and sort
+// Retry with exponential backoff
+async function withRetry(fn, retries, baseDelayMs) {
+  var delay = baseDelayMs || 400;
+  for (var i = 0; i <= retries; i++) {
+    try { return await fn(); } catch(e) {
+      if (i === retries) throw e;
+      await new Promise(function(r) { setTimeout(r, delay); });
+      delay = Math.min(delay * 2, 8000);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BINANCE  (crypto primary)
+// ═══════════════════════════════════════════════════════════
+async function fetchBinanceBatch(symbol, iv, startMs, endMs) {
+  var url = 'https://api.binance.com/api/v3/klines' +
+    '?symbol=' + symbol + '&interval=' + iv +
+    '&startTime=' + startMs + '&endTime=' + endMs + '&limit=1000';
+  var res = await fetch(url);
+  if (!res.ok) throw new Error('Binance ' + res.status);
+  var rows = await res.json();
+  if (!Array.isArray(rows)) throw new Error('Binance bad payload');
+  return rows.map(function(k) {
+    return { time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] };
+  });
+}
+
+async function fetchBinanceHist(symbol, interval, startMs, endMs) {
+  var iv = IV_BINANCE[interval] || '1h';
+  var all = [], batchEnd = endMs;
+  while (batchEnd > startMs) {
+    var batch = await withRetry(function() {
+      return fetchBinanceBatch(symbol, iv, startMs, batchEnd);
+    }, 2);
+    if (!batch.length) break;
+    all = batch.concat(all);
+    if (batch.length < 1000) break;
+    batchEnd = batch[0].time * 1000 - 1;
+  }
   var map = new Map();
   all.forEach(function(c) { map.set(c.time, c); });
-  return Array.from(map.values()).sort(function(a, b) { return a.time - b.time; });
+  return Array.from(map.values()).sort(function(a,b){ return a.time-b.time; });
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SOURCE 1 — YAHOO FINANCE  (stocks/forex, up to cutoff)
+//  BYBIT  (crypto fallback — different exchange, 1000 candles/call)
 // ═══════════════════════════════════════════════════════════
+async function fetchBybitBatch(symbol, iv, startMs, endMs) {
+  var url = 'https://api.bybit.com/v5/market/kline' +
+    '?category=spot&symbol=' + symbol +
+    '&interval=' + iv + '&start=' + startMs + '&end=' + endMs + '&limit=1000';
+  var res = await fetch(url);
+  if (!res.ok) throw new Error('Bybit ' + res.status);
+  var json = await res.json();
+  if (json.retCode !== 0) throw new Error('Bybit: ' + json.retMsg);
+  // Bybit returns newest-first: [startTime, open, high, low, close, volume, turnover]
+  return json.result.list.map(function(k) {
+    return { time:Math.floor(+k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] };
+  }).reverse();
+}
+
+async function fetchBybitHist(symbol, interval, startMs, endMs) {
+  var iv = IV_BYBIT[interval] || '60';
+  var all = [], batchEnd = endMs;
+  while (batchEnd > startMs) {
+    var batch = await withRetry(function() {
+      return fetchBybitBatch(symbol, iv, startMs, batchEnd);
+    }, 2);
+    if (!batch.length) break;
+    all = batch.concat(all);
+    if (batch.length < 1000) break;
+    batchEnd = batch[0].time * 1000 - 1;
+  }
+  var map = new Map();
+  all.forEach(function(c) { map.set(c.time, c); });
+  return Array.from(map.values()).sort(function(a,b){ return a.time-b.time; });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CRYPTO HISTORICAL — fallback chain: Binance → Bybit
+// ═══════════════════════════════════════════════════════════
+async function fetchCryptoHist(symbol, interval, startMs, endMs) {
+  try {
+    var data = await fetchBinanceHist(symbol, interval, startMs, endMs);
+    return { data: data, src: 'Binance REST' };
+  } catch(e1) {
+    try {
+      var data2 = await fetchBybitHist(symbol, interval, startMs, endMs);
+      return { data: data2, src: 'Bybit REST (fallback)' };
+    } catch(e2) {
+      throw new Error('Binance: ' + e1.message + ' | Bybit: ' + e2.message);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  KRAKEN  (crypto gap fill primary — genuinely different exchange)
+// ═══════════════════════════════════════════════════════════
+async function fetchKrakenGap(symbol, interval, sinceSec) {
+  var pair = KRAKEN_MAP[symbol];
+  if (!pair) throw new Error('No Kraken pair for ' + symbol);
+  var ivMin = IV_KRAKEN[interval] || 60;
+  var url = 'https://api.kraken.com/0/public/OHLC' +
+    '?pair=' + pair + '&interval=' + ivMin + '&since=' + sinceSec;
+  var res = await withRetry(function() { return fetch(url); }, 2);
+  if (!res.ok) throw new Error('Kraken ' + res.status);
+  var json = await res.json();
+  if (json.error && json.error.length) throw new Error(json.error[0]);
+  var key = Object.keys(json.result).find(function(k){ return k !== 'last'; });
+  return (json.result[key] || []).map(function(k) {
+    return { time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[6] };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CRYPTO GAP FILL — fallback chain: Kraken → Bybit → Binance
+// ═══════════════════════════════════════════════════════════
+async function fetchCryptoGap(symbol, interval, cutoffSec, nowMs) {
+  // Kraken: different exchange (best data independence)
+  try {
+    var d = await fetchKrakenGap(symbol, interval, cutoffSec);
+    return { data: d, src: 'Kraken REST' };
+  } catch(e1) {}
+  // Bybit fallback
+  try {
+    var d2 = await fetchBybitBatch(symbol, IV_BYBIT[interval]||'60', cutoffSec*1000, nowMs);
+    return { data: d2, src: 'Bybit REST (gap fallback)' };
+  } catch(e2) {}
+  // Binance last resort
+  try {
+    var d3 = await fetchBinanceBatch(symbol, IV_BINANCE[interval]||'1h', cutoffSec*1000, nowMs);
+    return { data: d3, src: 'Binance REST (gap fallback)' };
+  } catch(e3) {
+    return { data: [], src: 'gap failed' };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  YAHOO FINANCE  (stocks via CORS proxy chain)
+// ═══════════════════════════════════════════════════════════
+async function fetchYahooUrl(yUrl) {
+  return proxyFetch(yUrl);
+}
+
 async function fetchYahooHist(symbol, interval, cutoffSec) {
   var iv    = IV_YAHOO[interval]    || '60m';
   var range = YAHOO_RANGE[interval] || '60d';
   var yUrl  = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
-    encodeURIComponent(symbol) +
-    '?interval=' + iv + '&range=' + range + '&includePrePost=false';
-  var res = await fetch(CORS_PROXY + yUrl);
-  if (!res.ok) throw new Error('Yahoo HTTP ' + res.status);
+    encodeURIComponent(symbol) + '?interval=' + iv + '&range=' + range + '&includePrePost=false';
+  var res     = await withRetry(function(){ return fetchYahooUrl(yUrl); }, 2);
   var json    = await res.json();
   var candles = parseYahoo(json, null, cutoffSec);
+  if (interval === '4h') candles = aggregateTo4h(candles);
+  return candles;
+}
+
+async function fetchYahooRecent(symbol, interval, cutoffSec) {
+  var iv   = IV_YAHOO[interval] || '60m';
+  var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
+    encodeURIComponent(symbol) + '?interval=' + iv + '&range=1d&includePrePost=false';
+  var res     = await withRetry(function(){ return fetchYahooUrl(yUrl); }, 2);
+  var json    = await res.json();
+  var candles = parseYahoo(json, cutoffSec, null);
   if (interval === '4h') candles = aggregateTo4h(candles);
   return candles;
 }
@@ -217,70 +372,24 @@ async function fetchYahooHist(symbol, interval, cutoffSec) {
 function parseYahoo(json, sinceSec, cutoffSec) {
   var result = json && json.chart && json.chart.result && json.chart.result[0];
   if (!result) throw new Error('Yahoo: empty result');
-  var ts = result.timestamp;
-  var q  = result.indicators.quote[0];
-  var out = [];
+  var ts = result.timestamp, q = result.indicators.quote[0], out = [];
   for (var i = 0; i < ts.length; i++) {
-    if (q.close[i] == null || q.open[i] == null) continue;
-    if (cutoffSec != null && ts[i] > cutoffSec) continue;
-    if (sinceSec  != null && ts[i] <= sinceSec)  continue;
+    if (q.close[i]==null||q.open[i]==null) continue;
+    if (cutoffSec!=null && ts[i]>cutoffSec) continue;
+    if (sinceSec !=null && ts[i]<=sinceSec)  continue;
     out.push({ time:ts[i], open:q.open[i], high:q.high[i], low:q.low[i], close:q.close[i], volume:q.volume[i]||0 });
   }
   return out;
 }
 
-// Aggregate 1h candles into UTC-aligned 4h buckets
 function aggregateTo4h(candles) {
-  var SEC_4H = 4 * 3600;
-  var map = new Map();
+  var S4H = 4*3600, map = new Map();
   candles.forEach(function(c) {
-    var bucket = Math.floor(c.time / SEC_4H) * SEC_4H;
-    if (!map.has(bucket)) {
-      map.set(bucket, { time:bucket, open:c.open, high:c.high, low:c.low, close:c.close, volume:c.volume });
-    } else {
-      var b = map.get(bucket);
-      if (c.high > b.high) b.high = c.high;
-      if (c.low  < b.low)  b.low  = c.low;
-      b.close   = c.close;
-      b.volume += c.volume;
-    }
+    var b = Math.floor(c.time/S4H)*S4H;
+    if (!map.has(b)) { map.set(b,{time:b,open:c.open,high:c.high,low:c.low,close:c.close,volume:c.volume}); }
+    else { var x=map.get(b); if(c.high>x.high)x.high=c.high; if(c.low<x.low)x.low=c.low; x.close=c.close; x.volume+=c.volume; }
   });
-  return Array.from(map.values()).sort(function(a, b) { return a.time - b.time; });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  SOURCE 2 — KRAKEN  (crypto gap fill, different exchange)
-// ═══════════════════════════════════════════════════════════
-async function fetchKrakenGap(symbol, interval, sinceSec) {
-  var pair = KRAKEN_MAP[symbol];
-  if (!pair) throw new Error('No Kraken mapping for ' + symbol);
-  var ivMin = IV_KRAKEN[interval] || 60;
-  var url   = 'https://api.kraken.com/0/public/OHLC' +
-    '?pair=' + pair + '&interval=' + ivMin + '&since=' + sinceSec;
-  var res = await fetch(url);
-  if (!res.ok) throw new Error('Kraken HTTP ' + res.status);
-  var json = await res.json();
-  if (json.error && json.error.length) throw new Error(json.error[0]);
-  var key  = Object.keys(json.result).find(function(k) { return k !== 'last'; });
-  var rows = json.result[key] || [];
-  return rows.map(function(k) {
-    return { time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[6] };
-  });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  SOURCE 2 — YAHOO FINANCE RECENT  (stocks gap fill)
-// ═══════════════════════════════════════════════════════════
-async function fetchYahooRecent(symbol, interval, cutoffSec) {
-  var iv   = IV_YAHOO[interval] || '60m';
-  var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
-    encodeURIComponent(symbol) + '?interval=' + iv + '&range=1d&includePrePost=false';
-  var res = await fetch(CORS_PROXY + yUrl);
-  if (!res.ok) throw new Error('Yahoo recent HTTP ' + res.status);
-  var json    = await res.json();
-  var candles = parseYahoo(json, cutoffSec, null);
-  if (interval === '4h') candles = aggregateTo4h(candles);
-  return candles;
+  return Array.from(map.values()).sort(function(a,b){return a.time-b.time;});
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -288,16 +397,15 @@ async function fetchYahooRecent(symbol, interval, cutoffSec) {
 // ═══════════════════════════════════════════════════════════
 function merge(primary, fill) {
   var map = new Map();
-  primary.forEach(function(c) { map.set(c.time, c); });
-  fill.forEach(function(c)    { map.set(c.time, c); });
-  return Array.from(map.values()).sort(function(a, b) { return a.time - b.time; });
+  primary.forEach(function(c){ map.set(c.time,c); });
+  fill.forEach(function(c){ map.set(c.time,c); });
+  return Array.from(map.values()).sort(function(a,b){return a.time-b.time;});
 }
 
 // ═══════════════════════════════════════════════════════════
 //  CHART STATE
 // ═══════════════════════════════════════════════════════════
-var chart, candleSeries, volumeSeries;
-var ws, stockPoller;
+var chart, candleSeries, volumeSeries, ws, stockPoller;
 
 // ═══════════════════════════════════════════════════════════
 //  CHART INIT
@@ -305,147 +413,94 @@ var ws, stockPoller;
 function initChart() {
   var el = document.getElementById('chart');
   chart = LightweightCharts.createChart(el, {
-    layout: { background:{ color:'#131722' }, textColor:'#d1d4dc' },
-    grid:   { vertLines:{ color:'#1e222d' }, horzLines:{ color:'#1e222d' } },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor:'#2a2e39', scaleMargins:{ top:0.05, bottom:0.25 } },
-    timeScale: { borderColor:'#2a2e39', timeVisible:true, secondsVisible:false },
+    layout:{ background:{ color:'#131722' }, textColor:'#d1d4dc' },
+    grid:{ vertLines:{ color:'#1e222d' }, horzLines:{ color:'#1e222d' } },
+    crosshair:{ mode:LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale:{ borderColor:'#2a2e39', scaleMargins:{ top:0.05, bottom:0.25 } },
+    timeScale:{ borderColor:'#2a2e39', timeVisible:true, secondsVisible:false },
   });
-
   candleSeries = chart.addCandlestickSeries({
-    upColor:'#26a69a', downColor:'#ef5350',
-    borderVisible:false,
-    wickUpColor:'#26a69a', wickDownColor:'#ef5350',
+    upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,
+    wickUpColor:'#26a69a',wickDownColor:'#ef5350',
   });
-
-  volumeSeries = chart.addHistogramSeries({
-    priceFormat:{ type:'volume' },
-    priceScaleId:'vol',
-  });
+  volumeSeries = chart.addHistogramSeries({ priceFormat:{type:'volume'}, priceScaleId:'vol' });
   volumeSeries.priceScale().applyOptions({ scaleMargins:{ top:0.78, bottom:0 } });
 
   chart.subscribeCrosshairMove(function(param) {
-    var overlay = document.getElementById('ohlcOverlay');
-    if (!param.time) { overlay.style.display = 'none'; return; }
+    var ov = document.getElementById('ohlcOverlay');
+    if (!param.time) { ov.style.display='none'; return; }
     var c = param.seriesData.get(candleSeries);
-    if (!c) { overlay.style.display = 'none'; return; }
-    var cls = c.close >= c.open ? 'up' : 'down';
-    overlay.style.display = 'block';
-    overlay.innerHTML =
-      'O&nbsp;<span class="' + cls + '">' + fmt(c.open)  + '</span>&ensp;' +
-      'H&nbsp;<span class="' + cls + '">' + fmt(c.high)  + '</span>&ensp;' +
-      'L&nbsp;<span class="' + cls + '">' + fmt(c.low)   + '</span>&ensp;' +
-      'C&nbsp;<span class="' + cls + '">' + fmt(c.close) + '</span>';
+    if (!c) { ov.style.display='none'; return; }
+    var cls = c.close>=c.open?'up':'down';
+    ov.style.display='block';
+    ov.innerHTML='O&nbsp;<span class="'+cls+'">'+fmt(c.open)+'</span>&ensp;'+
+      'H&nbsp;<span class="'+cls+'">'+fmt(c.high)+'</span>&ensp;'+
+      'L&nbsp;<span class="'+cls+'">'+fmt(c.low)+'</span>&ensp;'+
+      'C&nbsp;<span class="'+cls+'">'+fmt(c.close)+'</span>';
   });
-
-  var ro = new ResizeObserver(function() {
-    chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-  });
-  ro.observe(el);
-  chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+  new ResizeObserver(function(){ chart.applyOptions({ width:el.clientWidth, height:el.clientHeight }); }).observe(el);
+  chart.applyOptions({ width:el.clientWidth, height:el.clientHeight });
 }
 
-function fmt(n) {
-  if (n >= 1000) return n.toFixed(2);
-  if (n >= 1)    return n.toFixed(4);
-  return n.toFixed(6);
-}
+function fmt(n) { return n>=1000?n.toFixed(2):n>=1?n.toFixed(4):n.toFixed(6); }
 
-// ═══════════════════════════════════════════════════════════
-//  PRICE + CHANGE DISPLAY
-// ═══════════════════════════════════════════════════════════
 function setPrice(candles) {
   if (!candles.length) return;
-  var last  = candles[candles.length - 1];
-  var first = candles[0];
-  var cls   = last.close >= last.open ? 'up' : 'down';
-  document.getElementById('priceDisplay').innerHTML =
-    '<span class="' + cls + '">' + fmt(last.close) + '</span>';
-  var chg    = (last.close - first.open) / first.open * 100;
-  var chgCls = chg >= 0 ? 'up' : 'down';
-  document.getElementById('changeDisplay').innerHTML =
-    '<span class="' + chgCls + '">' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</span>';
+  var last=candles[candles.length-1], first=candles[0];
+  var cls=last.close>=last.open?'up':'down';
+  document.getElementById('priceDisplay').innerHTML='<span class="'+cls+'">'+fmt(last.close)+'</span>';
+  var chg=(last.close-first.open)/first.open*100;
+  document.getElementById('changeDisplay').innerHTML=
+    '<span class="'+(chg>=0?'up':'down')+'">'+(chg>=0?'+':'')+chg.toFixed(2)+'%</span>';
 }
 
 function updateLiveCandle(c) {
-  candleSeries.update({ time:c.time, open:c.open, high:c.high, low:c.low, close:c.close });
-  if (c.volume != null) {
-    volumeSeries.update({
-      time:c.time, value:c.volume,
-      color: c.close >= c.open ? 'rgba(38,166,154,0.5)' : 'rgba(239,83,80,0.5)'
-    });
-  }
-  var cls = c.close >= c.open ? 'up' : 'down';
-  document.getElementById('priceDisplay').innerHTML =
-    '<span class="' + cls + '">' + fmt(c.close) + '</span>';
-  document.getElementById('sTime').textContent =
-    'Updated ' + new Date().toLocaleTimeString();
+  candleSeries.update({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close});
+  if (c.volume!=null) volumeSeries.update({time:c.time,value:c.volume,color:c.close>=c.open?'rgba(38,166,154,0.5)':'rgba(239,83,80,0.5)'});
+  var cls=c.close>=c.open?'up':'down';
+  document.getElementById('priceDisplay').innerHTML='<span class="'+cls+'">'+fmt(c.close)+'</span>';
+  document.getElementById('sTime').textContent='Updated '+new Date().toLocaleTimeString();
 }
 
 // ═══════════════════════════════════════════════════════════
-//  LIVE — BINANCE WEBSOCKET  (crypto)
+//  LIVE — BINANCE WEBSOCKET
 // ═══════════════════════════════════════════════════════════
 function connectBinanceWS(symbol, interval) {
   stopLive();
-  var stream = symbol.toLowerCase() + '@kline_' + (IV_BINANCE[interval] || '1h');
-  ws = new WebSocket('wss://stream.binance.com:9443/ws/' + stream);
-  ws.onopen = function() {
-    setS('sLive', '<span class="ok">Binance WebSocket &#9679; live</span>');
-  };
-  ws.onmessage = function(e) {
-    var k = JSON.parse(e.data).k;
-    updateLiveCandle({
-      time:Math.floor(k.t / 1000), open:+k.o, high:+k.h, low:+k.l, close:+k.c, volume:+k.v
-    });
-  };
-  ws.onclose = function() {
-    setS('sLive', '<span class="warn">WS closed &mdash; reconnecting&hellip;</span>');
-    setTimeout(function() { connectBinanceWS(symbol, interval); }, 3000);
-  };
-  ws.onerror = function() { ws.close(); };
+  var stream = symbol.toLowerCase()+'@kline_'+(IV_BINANCE[interval]||'1h');
+  ws = new WebSocket('wss://stream.binance.com:9443/ws/'+stream);
+  ws.onopen   = function(){ setS('sLive','<span class="ok">Binance WS &#9679; live</span>'); };
+  ws.onmessage= function(e){ var k=JSON.parse(e.data).k; updateLiveCandle({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c,volume:+k.v}); };
+  ws.onclose  = function(){ setS('sLive','<span class="warn">WS reconnecting&hellip;</span>'); setTimeout(function(){connectBinanceWS(symbol,interval);},3000); };
+  ws.onerror  = function(){ ws.close(); };
 }
 
 // ═══════════════════════════════════════════════════════════
-//  LIVE — YAHOO POLL  (stocks, every 30s)
+//  LIVE — YAHOO POLL (stocks)
 // ═══════════════════════════════════════════════════════════
 function startYahooPoll(symbol, interval) {
   stopLive();
-  var iv = IV_YAHOO[interval] || '60m';
+  var iv = IV_YAHOO[interval]||'60m';
   function poll() {
-    var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
-      encodeURIComponent(symbol) + '?interval=' + iv + '&range=1d&includePrePost=false';
-    fetch(CORS_PROXY + yUrl)
-      .then(function(r) { return r.json(); })
-      .then(function(json) {
-        var result = json && json.chart && json.chart.result && json.chart.result[0];
-        if (!result) return;
-        var ts = result.timestamp;
-        var q  = result.indicators.quote[0];
-        if (!ts || !ts.length) return;
-        var i = ts.length - 1;
-        while (i >= 0 && q.close[i] == null) i--;
-        if (i < 0) return;
-        updateLiveCandle({
-          time:ts[i], open:q.open[i], high:q.high[i],
-          low:q.low[i], close:q.close[i], volume:q.volume[i]||0
-        });
-        setS('sLive', '<span class="ok">Yahoo poll &#10003;</span>');
-      })
-      .catch(function(e) {
-        setS('sLive', '<span class="err">Poll error: ' + e.message + '</span>');
-      });
+    var yUrl='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(symbol)+'?interval='+iv+'&range=1d&includePrePost=false';
+    fetchYahooUrl(yUrl).then(function(r){return r.json();}).then(function(json){
+      var result=json&&json.chart&&json.chart.result&&json.chart.result[0]; if(!result)return;
+      var ts=result.timestamp,q=result.indicators.quote[0]; if(!ts||!ts.length)return;
+      var i=ts.length-1; while(i>=0&&q.close[i]==null)i--; if(i<0)return;
+      updateLiveCandle({time:ts[i],open:q.open[i],high:q.high[i],low:q.low[i],close:q.close[i],volume:q.volume[i]||0});
+      setS('sLive','<span class="ok">Yahoo poll &#10003;</span>');
+    }).catch(function(e){ setS('sLive','<span class="err">Poll: '+e.message+'</span>'); });
   }
-  poll();
-  stockPoller = setInterval(poll, 30000);
-  setS('sLive', '<span class="warn">Yahoo poll (30s)</span>');
+  poll(); stockPoller=setInterval(poll,30000);
+  setS('sLive','<span class="warn">Yahoo poll 30s</span>');
 }
 
 function stopLive() {
-  if (ws) { try { ws.close(); } catch(e) {} ws = null; }
-  if (stockPoller) { clearInterval(stockPoller); stockPoller = null; }
+  if(ws){try{ws.close();}catch(e){}ws=null;}
+  if(stockPoller){clearInterval(stockPoller);stockPoller=null;}
 }
 
-function setS(id, html) { document.getElementById(id).innerHTML = html; }
+function setS(id,html){ document.getElementById(id).innerHTML=html; }
 
 // ═══════════════════════════════════════════════════════════
 //  MAIN LOAD
@@ -456,91 +511,102 @@ async function loadChart() {
   if (!rawSymbol) return;
 
   stopLive();
-  setS('s1',    'loading&hellip;');
-  setS('s2',    'loading&hellip;');
-  setS('sLive', '&mdash;');
-  document.getElementById('priceDisplay').textContent  = '—';
-  document.getElementById('changeDisplay').textContent = '';
+  setS('s1','loading&hellip;'); setS('s2','loading&hellip;');
+  setS('sLive','&mdash;');
+  document.getElementById('priceDisplay').textContent='—';
+  document.getElementById('changeDisplay').textContent='';
 
-  var nBars     = HIST_BARS[interval] || 500;
+  var nBars     = HIST_BARS[interval]||500;
   var now       = Date.now();
-  var cutoffMs  = now - LAG_MIN * 60 * 1000;
-  var cutoffSec = Math.floor(cutoffMs / 1000);
-  var startMs   = cutoffMs - nBars * (IV_MS[interval] || 3600e3);
+  var cutoffMs  = now - LAG_MIN*60*1000;
+  var cutoffSec = Math.floor(cutoffMs/1000);
+  var startMs   = cutoffMs - nBars*(IV_MS[interval]||3600e3);
 
-  var hist = [], gap = [];
+  var hist=[], gap=[];
 
   if (isCrypto(rawSymbol)) {
     var symbol = normalizeBinance(rawSymbol);
     document.getElementById('symbolInput').value = symbol;
 
-    // Source 1 — Binance REST (paginated, up to cutoff)
-    try {
-      hist = await fetchBinanceHist(symbol, interval, startMs, cutoffMs);
-      setS('s1', '<span class="ok">Binance REST (' + hist.length + ' bars)</span>');
-    } catch(e) {
-      setS('s1', '<span class="err">Binance: ' + e.message + '</span>');
+    // Check localStorage cache first
+    var cached = loadCache(symbol, interval);
+    if (cached) {
+      renderCandles(cached);
+      setS('s1','<span class="cache">&#9679; cache ('+cached.length+' bars)</span>');
+      setS('s2','<span class="cache">served from cache</span>');
+      connectBinanceWS(symbol, interval);
+      return;
     }
 
-    // Source 2 — Kraken REST (gap fill, different exchange)
+    // Source 1: Binance → Bybit fallback
     try {
-      gap = await fetchKrakenGap(symbol, interval, cutoffSec);
-      setS('s2', '<span class="ok">Kraken REST (' + gap.length + ' bars)</span>');
+      var r1 = await fetchCryptoHist(symbol, interval, startMs, cutoffMs);
+      hist   = r1.data;
+      setS('s1','<span class="ok">'+r1.src+' ('+hist.length+' bars)</span>');
     } catch(e) {
-      try {
-        gap = await fetchBinanceHist(symbol, interval, cutoffMs, now);
-        setS('s2', '<span class="warn">Binance fallback (' + gap.length + ' bars)</span>');
-      } catch(e2) {
-        setS('s2', '<span class="err">Gap error: ' + e2.message + '</span>');
-      }
+      setS('s1','<span class="err">Hist failed: '+e.message+'</span>');
     }
 
+    // Source 2: Kraken → Bybit → Binance fallback
+    var r2 = await fetchCryptoGap(symbol, interval, cutoffSec, now);
+    gap    = r2.data;
+    var gapClass = r2.src.includes('failed') ? 'err' : r2.src.includes('fallback') ? 'warn' : 'ok';
+    setS('s2','<span class="'+gapClass+'">'+r2.src+' ('+gap.length+' bars)</span>');
+
+    var merged = merge(hist, gap);
+    saveCache(symbol, interval, merged);
+    renderCandles(merged);
     connectBinanceWS(symbol, interval);
 
   } else {
-    // Source 1 — Yahoo Finance
+    // Stocks: check cache
+    var cachedS = loadCache(rawSymbol, interval);
+    if (cachedS) {
+      renderCandles(cachedS);
+      setS('s1','<span class="cache">&#9679; cache ('+cachedS.length+' bars)</span>');
+      setS('s2','<span class="cache">served from cache</span>');
+      startYahooPoll(rawSymbol, interval);
+      return;
+    }
+
+    // Source 1: Yahoo Finance (CORS proxy chain)
     try {
       hist = await fetchYahooHist(rawSymbol, interval, cutoffSec);
-      var label = interval === '4h' ? ' (aggregated from 1h)' : '';
-      setS('s1', '<span class="ok">Yahoo Finance (' + hist.length + ' bars' + label + ')</span>');
+      var lbl = interval==='4h'?' (agg 1h→4h)':'';
+      setS('s1','<span class="ok">Yahoo Finance ('+hist.length+' bars'+lbl+')</span>');
     } catch(e) {
-      setS('s1', '<span class="err">Yahoo: ' + e.message + '</span>');
+      setS('s1','<span class="err">Yahoo hist: '+e.message+'</span>');
     }
 
-    // Source 2 — Yahoo Finance recent gap fill
+    // Source 2: Yahoo Finance recent
     try {
       gap = await fetchYahooRecent(rawSymbol, interval, cutoffSec);
-      setS('s2', '<span class="ok">Yahoo Finance gap (' + gap.length + ' bars)</span>');
+      setS('s2','<span class="ok">Yahoo Finance gap ('+gap.length+' bars)</span>');
     } catch(e) {
-      setS('s2', '<span class="err">Gap error: ' + e.message + '</span>');
+      setS('s2','<span class="err">Yahoo gap: '+e.message+'</span>');
     }
 
+    var mergedS = merge(hist, gap);
+    saveCache(rawSymbol, interval, mergedS);
+    renderCandles(mergedS);
     startYahooPoll(rawSymbol, interval);
   }
-
-  var merged = merge(hist, gap);
-
-  candleSeries.setData(merged.map(function(c) {
-    return { time:c.time, open:c.open, high:c.high, low:c.low, close:c.close };
-  }));
-  volumeSeries.setData(merged.map(function(c) {
-    return {
-      time:c.time, value:c.volume,
-      color: c.close >= c.open ? 'rgba(38,166,154,0.5)' : 'rgba(239,83,80,0.5)'
-    };
-  }));
-
-  chart.timeScale().fitContent();
-  setPrice(merged);
-  document.getElementById('sTime').textContent = 'Loaded ' + new Date().toLocaleTimeString();
 }
 
-// Enter key to load
-document.getElementById('symbolInput').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter') loadChart();
-});
+function renderCandles(merged) {
+  candleSeries.setData(merged.map(function(c){
+    return {time:c.time,open:c.open,high:c.high,low:c.low,close:c.close};
+  }));
+  volumeSeries.setData(merged.map(function(c){
+    return {time:c.time,value:c.volume,color:c.close>=c.open?'rgba(38,166,154,0.5)':'rgba(239,83,80,0.5)'};
+  }));
+  chart.timeScale().fitContent();
+  setPrice(merged);
+  document.getElementById('sTime').textContent='Loaded '+new Date().toLocaleTimeString();
+}
 
-// Boot
+document.getElementById('symbolInput').addEventListener('keydown',function(e){ if(e.key==='Enter') loadChart(); });
+
 initChart();
 loadChart();
 </script>
