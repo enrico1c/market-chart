@@ -11,6 +11,7 @@
       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; }
     body { display:flex; flex-direction:column; }
 
+    /* ── Toolbar ── */
     .toolbar {
       background:#1e222d; border-bottom:1px solid #2a2e39;
       padding:8px 16px; display:flex; align-items:center; gap:10px; flex-shrink:0;
@@ -31,36 +32,61 @@
       cursor:pointer; transition:background 0.15s;
     }
     .btn:hover { background:#1e53e5; }
+    .btn-sm {
+      background:#2a2e39; border:1px solid #363a45; color:#d1d4dc;
+      padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer;
+    }
+    .btn-sm.active { background:#2962ff; border-color:#2962ff; color:#fff; }
     .price-display { margin-left:8px; font-size:15px; font-weight:700; min-width:100px; }
     .change-display { font-size:12px; }
     .up   { color:#26a69a; }
     .down { color:#ef5350; }
+    .sep  { color:#363a45; }
 
-    .chart-wrap { position:relative; flex:1; min-height:0; }
-    #chart { width:100%; height:100%; }
+    /* ── Chart area ── */
+    .chart-area { display:flex; flex-direction:column; flex:1; min-height:0; }
+
+    .chart-main { position:relative; flex:65; min-height:0; }
+    #chartMain  { width:100%; height:100%; }
+
+    .chart-rsi  {
+      position:relative; flex:35; min-height:0;
+      border-top:1px solid #2a2e39;
+    }
+    #chartRsi   { width:100%; height:100%; }
+
+    /* ── Overlays ── */
     .ohlc-overlay {
-      position:absolute; top:8px; left:10px; font-size:12px; color:#d1d4dc;
-      pointer-events:none; z-index:10; background:rgba(19,23,34,0.8);
+      position:absolute; top:6px; left:8px; font-size:11px; color:#d1d4dc;
+      pointer-events:none; z-index:10; background:rgba(19,23,34,0.85);
       padding:3px 8px; border-radius:3px; display:none;
     }
+    .rsi-label {
+      position:absolute; top:4px; left:8px; font-size:10px; color:#787b86;
+      pointer-events:none; z-index:10;
+    }
+    .rsi-value {
+      position:absolute; top:4px; left:54px; font-size:10px; font-weight:600;
+      pointer-events:none; z-index:10;
+    }
 
+    /* ── Status bar ── */
     .statusbar {
       background:#1e222d; border-top:1px solid #2a2e39;
       padding:4px 16px; font-size:11px; color:#787b86;
       display:flex; gap:20px; flex-shrink:0; align-items:center;
     }
     .statusbar .right { margin-left:auto; }
-    .ok   { color:#26a69a; }
-    .err  { color:#ef5350; }
-    .warn { color:#f57c00; }
-    .cache{ color:#7c4dff; }
+    .ok    { color:#26a69a; }
+    .err   { color:#ef5350; }
+    .warn  { color:#f57c00; }
+    .cache { color:#7c4dff; }
   </style>
 </head>
 <body>
 
 <div class="toolbar">
-  <input type="text" id="symbolInput" value="BTCUSDT"
-         placeholder="BTCUSDT / AAPL / SPY" />
+  <input type="text" id="symbolInput" value="BTCUSDT" placeholder="BTCUSDT / AAPL" />
   <select id="intervalSelect">
     <option value="1m">1m</option>
     <option value="5m">5m</option>
@@ -72,18 +98,29 @@
     <option value="1w">1w</option>
   </select>
   <button class="btn" onclick="loadChart()">Load</button>
+  <span class="sep">|</span>
+  <button class="btn-sm active" id="btnEMA20" onclick="toggleIndicator('ema20')">EMA 20</button>
+  <button class="btn-sm active" id="btnEMA50" onclick="toggleIndicator('ema50')">EMA 50</button>
+  <button class="btn-sm active" id="btnRSI"   onclick="toggleIndicator('rsi')">RSI 14</button>
   <div class="price-display" id="priceDisplay">&mdash;</div>
   <div class="change-display" id="changeDisplay"></div>
 </div>
 
-<div class="chart-wrap">
-  <div id="chart"></div>
-  <div class="ohlc-overlay" id="ohlcOverlay"></div>
+<div class="chart-area">
+  <div class="chart-main">
+    <div id="chartMain"></div>
+    <div class="ohlc-overlay" id="ohlcOverlay"></div>
+  </div>
+  <div class="chart-rsi" id="rsiWrap">
+    <div id="chartRsi"></div>
+    <div class="rsi-label">RSI 14</div>
+    <div class="rsi-value" id="rsiValue">&mdash;</div>
+  </div>
 </div>
 
 <div class="statusbar">
   <span>Src 1: <span id="s1">&mdash;</span></span>
-  <span>Src 2 (gap): <span id="s2">&mdash;</span></span>
+  <span>Src 2: <span id="s2">&mdash;</span></span>
   <span>Live: <span id="sLive">&mdash;</span></span>
   <span class="right" id="sTime">&mdash;</span>
 </div>
@@ -93,403 +130,426 @@
 //  CONFIG
 // ═══════════════════════════════════════════════════════════
 var LAG_MIN   = 10;
-var CACHE_TTL = 5 * 60 * 1000;   // 5 minutes — candles served from localStorage
+var CACHE_TTL = 5 * 60 * 1000;
+var EMA_FAST  = 20;
+var EMA_SLOW  = 50;
+var RSI_PER   = 14;
 
-// Bars to fetch per interval (crypto paginates to exceed 1000)
-var HIST_BARS = {
-  '1m':2880,'5m':1440,'15m':960,'30m':720,
-  '1h':500,'4h':500,'1d':500,'1w':200
-};
-
-// CORS proxy fallback chain for stock/forex requests
-var CORS_PROXIES = [
-  'https://corsproxy.io/?',
-  'https://api.allorigins.win/raw?url='
-];
+var HIST_BARS = { '1m':2880,'5m':1440,'15m':960,'30m':720,'1h':500,'4h':500,'1d':500,'1w':200 };
+var CORS_PROXIES = ['https://corsproxy.io/?','https://api.allorigins.win/raw?url='];
 
 // ═══════════════════════════════════════════════════════════
 //  INTERVAL TABLES
 // ═══════════════════════════════════════════════════════════
-var IV_MS = {
-  '1m':60e3,'5m':300e3,'15m':900e3,'30m':1800e3,
-  '1h':3600e3,'4h':14400e3,'1d':86400e3,'1w':604800e3
-};
-var IV_BINANCE = {
-  '1m':'1m','5m':'5m','15m':'15m','30m':'30m',
-  '1h':'1h','4h':'4h','1d':'1d','1w':'1w'
-};
-// Bybit uses numeric minutes except D/W
-var IV_BYBIT = {
-  '1m':'1','5m':'5','15m':'15','30m':'30',
-  '1h':'60','4h':'240','1d':'D','1w':'W'
-};
-var IV_KRAKEN = {
-  '1m':1,'5m':5,'15m':15,'30m':30,
-  '1h':60,'4h':240,'1d':1440,'1w':10080
-};
-var IV_YAHOO = {
-  '1m':'1m','5m':'5m','15m':'15m','30m':'30m',
-  '1h':'60m','4h':'60m','1d':'1d','1w':'1wk'
-};
-var YAHOO_RANGE = {
-  '1m':'7d','5m':'60d','15m':'60d','30m':'60d',
-  '1h':'730d','4h':'365d','1d':'max','1w':'max'
-};
+var IV_MS      = { '1m':60e3,'5m':300e3,'15m':900e3,'30m':1800e3,'1h':3600e3,'4h':14400e3,'1d':86400e3,'1w':604800e3 };
+var IV_BINANCE = { '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'1h','4h':'4h','1d':'1d','1w':'1w' };
+var IV_BYBIT   = { '1m':'1','5m':'5','15m':'15','30m':'30','1h':'60','4h':'240','1d':'D','1w':'W' };
+var IV_KRAKEN  = { '1m':1,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'1d':1440,'1w':10080 };
+var IV_YAHOO   = { '1m':'1m','5m':'5m','15m':'15m','30m':'30m','1h':'60m','4h':'60m','1d':'1d','1w':'1wk' };
+var YAHOO_RANGE= { '1m':'7d','5m':'60d','15m':'60d','30m':'60d','1h':'730d','4h':'365d','1d':'max','1w':'max' };
 
-// ═══════════════════════════════════════════════════════════
-//  KRAKEN PAIR MAP
-// ═══════════════════════════════════════════════════════════
 var KRAKEN_MAP = {
   'BTCUSDT':'XBTUSD','BTCUSD':'XBTUSD','ETHUSDT':'ETHUSD','ETHUSD':'ETHUSD',
   'SOLUSDT':'SOLUSD','ADAUSDT':'ADAUSD','XRPUSDT':'XRPUSD','DOTUSDT':'DOTUSD',
-  'LINKUSDT':'LINKUSD','LTCUSDT':'LTCUSD','DOGEUSDT':'XDGUSD',
-  'MATICUSDT':'MATICUSD','AVAXUSDT':'AVAXUSD','ATOMUSDT':'ATOMUSD',
-  'UNIUSDT':'UNIUSD','ALGOUSDT':'ALGOUSD','XLMUSDT':'XLMUSD',
-  'NEARUSDT':'NEARUSD','FILUSDT':'FILUSD','AAVEUSDT':'AAVEUSD',
-  'TRXUSDT':'TRXUSD','SANDUSDT':'SANDUSD','MANAUSDT':'MANAUSD',
-  'VETUSDT':'VETUSD','RUNEUSDT':'RUNEUSD','CHZUSDT':'CHZUSD',
+  'LINKUSDT':'LINKUSD','LTCUSDT':'LTCUSD','DOGEUSDT':'XDGUSD','MATICUSDT':'MATICUSD',
+  'AVAXUSDT':'AVAXUSD','ATOMUSDT':'ATOMUSD','UNIUSDT':'UNIUSD','ALGOUSDT':'ALGOUSD',
+  'XLMUSDT':'XLMUSD','NEARUSDT':'NEARUSD','FILUSDT':'FILUSD','AAVEUSDT':'AAVEUSD',
+  'TRXUSDT':'TRXUSD','SANDUSDT':'SANDUSD','MANAUSDT':'MANAUSD','VETUSDT':'VETUSD',
+  'RUNEUSDT':'RUNEUSD','CHZUSDT':'CHZUSD',
 };
 
 // ═══════════════════════════════════════════════════════════
-//  ASSET DETECTION
+//  INDICATOR CALCULATIONS
 // ═══════════════════════════════════════════════════════════
-function isCrypto(raw) {
-  var s = raw.toUpperCase().replace(/[\s\/\-_]/g,'');
-  if (/^(EURUSD|GBPUSD|USDJPY|AUDUSD|USDCHF|NZDUSD|USDCAD)/.test(s)) return false;
-  return /^[A-Z0-9]+(USDT|USDC|BUSD|BTC|ETH|BNB)$/.test(s);
-}
-function normalizeBinance(raw) {
-  return raw.toUpperCase().replace(/[\s\/\-_]/g,'');
-}
-
-// ═══════════════════════════════════════════════════════════
-//  LOCALSTORAGE CACHE  (eliminates redundant API calls)
-// ═══════════════════════════════════════════════════════════
-function cacheKey(symbol, interval) {
-  return 'chart_' + symbol + '_' + interval;
-}
-function saveCache(symbol, interval, candles) {
-  try {
-    localStorage.setItem(cacheKey(symbol, interval),
-      JSON.stringify({ ts: Date.now(), d: candles }));
-  } catch(e) {}
-}
-function loadCache(symbol, interval) {
-  try {
-    var raw = localStorage.getItem(cacheKey(symbol, interval));
-    if (!raw) return null;
-    var obj = JSON.parse(raw);
-    if (Date.now() - obj.ts > CACHE_TTL) return null;
-    return obj.d;
-  } catch(e) { return null; }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  GENERIC HELPERS
-// ═══════════════════════════════════════════════════════════
-
-// Fetch through CORS proxy chain — tries each proxy in order
-async function proxyFetch(url) {
-  var last;
-  for (var i = 0; i < CORS_PROXIES.length; i++) {
-    try {
-      var res = await fetch(CORS_PROXIES[i] + encodeURIComponent(url));
-      if (res.ok) return res;
-      last = new Error('HTTP ' + res.status + ' via proxy ' + i);
-    } catch(e) { last = e; }
-  }
-  throw last || new Error('All CORS proxies failed');
-}
-
-// Retry with exponential backoff
-async function withRetry(fn, retries, baseDelayMs) {
-  var delay = baseDelayMs || 400;
-  for (var i = 0; i <= retries; i++) {
-    try { return await fn(); } catch(e) {
-      if (i === retries) throw e;
-      await new Promise(function(r) { setTimeout(r, delay); });
-      delay = Math.min(delay * 2, 8000);
-    }
-  }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  BINANCE  (crypto primary)
-// ═══════════════════════════════════════════════════════════
-async function fetchBinanceBatch(symbol, iv, startMs, endMs) {
-  var url = 'https://api.binance.com/api/v3/klines' +
-    '?symbol=' + symbol + '&interval=' + iv +
-    '&startTime=' + startMs + '&endTime=' + endMs + '&limit=1000';
-  var res = await fetch(url);
-  if (!res.ok) throw new Error('Binance ' + res.status);
-  var rows = await res.json();
-  if (!Array.isArray(rows)) throw new Error('Binance bad payload');
-  return rows.map(function(k) {
-    return { time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] };
-  });
-}
-
-async function fetchBinanceHist(symbol, interval, startMs, endMs) {
-  var iv = IV_BINANCE[interval] || '1h';
-  var all = [], batchEnd = endMs;
-  while (batchEnd > startMs) {
-    var batch = await withRetry(function() {
-      return fetchBinanceBatch(symbol, iv, startMs, batchEnd);
-    }, 2);
-    if (!batch.length) break;
-    all = batch.concat(all);
-    if (batch.length < 1000) break;
-    batchEnd = batch[0].time * 1000 - 1;
-  }
-  var map = new Map();
-  all.forEach(function(c) { map.set(c.time, c); });
-  return Array.from(map.values()).sort(function(a,b){ return a.time-b.time; });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  BYBIT  (crypto fallback — different exchange, 1000 candles/call)
-// ═══════════════════════════════════════════════════════════
-async function fetchBybitBatch(symbol, iv, startMs, endMs) {
-  var url = 'https://api.bybit.com/v5/market/kline' +
-    '?category=spot&symbol=' + symbol +
-    '&interval=' + iv + '&start=' + startMs + '&end=' + endMs + '&limit=1000';
-  var res = await fetch(url);
-  if (!res.ok) throw new Error('Bybit ' + res.status);
-  var json = await res.json();
-  if (json.retCode !== 0) throw new Error('Bybit: ' + json.retMsg);
-  // Bybit returns newest-first: [startTime, open, high, low, close, volume, turnover]
-  return json.result.list.map(function(k) {
-    return { time:Math.floor(+k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] };
-  }).reverse();
-}
-
-async function fetchBybitHist(symbol, interval, startMs, endMs) {
-  var iv = IV_BYBIT[interval] || '60';
-  var all = [], batchEnd = endMs;
-  while (batchEnd > startMs) {
-    var batch = await withRetry(function() {
-      return fetchBybitBatch(symbol, iv, startMs, batchEnd);
-    }, 2);
-    if (!batch.length) break;
-    all = batch.concat(all);
-    if (batch.length < 1000) break;
-    batchEnd = batch[0].time * 1000 - 1;
-  }
-  var map = new Map();
-  all.forEach(function(c) { map.set(c.time, c); });
-  return Array.from(map.values()).sort(function(a,b){ return a.time-b.time; });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  CRYPTO HISTORICAL — fallback chain: Binance → Bybit
-// ═══════════════════════════════════════════════════════════
-async function fetchCryptoHist(symbol, interval, startMs, endMs) {
-  try {
-    var data = await fetchBinanceHist(symbol, interval, startMs, endMs);
-    return { data: data, src: 'Binance REST' };
-  } catch(e1) {
-    try {
-      var data2 = await fetchBybitHist(symbol, interval, startMs, endMs);
-      return { data: data2, src: 'Bybit REST (fallback)' };
-    } catch(e2) {
-      throw new Error('Binance: ' + e1.message + ' | Bybit: ' + e2.message);
-    }
-  }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  KRAKEN  (crypto gap fill primary — genuinely different exchange)
-// ═══════════════════════════════════════════════════════════
-async function fetchKrakenGap(symbol, interval, sinceSec) {
-  var pair = KRAKEN_MAP[symbol];
-  if (!pair) throw new Error('No Kraken pair for ' + symbol);
-  var ivMin = IV_KRAKEN[interval] || 60;
-  var url = 'https://api.kraken.com/0/public/OHLC' +
-    '?pair=' + pair + '&interval=' + ivMin + '&since=' + sinceSec;
-  var res = await withRetry(function() { return fetch(url); }, 2);
-  if (!res.ok) throw new Error('Kraken ' + res.status);
-  var json = await res.json();
-  if (json.error && json.error.length) throw new Error(json.error[0]);
-  var key = Object.keys(json.result).find(function(k){ return k !== 'last'; });
-  return (json.result[key] || []).map(function(k) {
-    return { time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[6] };
-  });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  CRYPTO GAP FILL — fallback chain: Kraken → Bybit → Binance
-// ═══════════════════════════════════════════════════════════
-async function fetchCryptoGap(symbol, interval, cutoffSec, nowMs) {
-  // Kraken: different exchange (best data independence)
-  try {
-    var d = await fetchKrakenGap(symbol, interval, cutoffSec);
-    return { data: d, src: 'Kraken REST' };
-  } catch(e1) {}
-  // Bybit fallback
-  try {
-    var d2 = await fetchBybitBatch(symbol, IV_BYBIT[interval]||'60', cutoffSec*1000, nowMs);
-    return { data: d2, src: 'Bybit REST (gap fallback)' };
-  } catch(e2) {}
-  // Binance last resort
-  try {
-    var d3 = await fetchBinanceBatch(symbol, IV_BINANCE[interval]||'1h', cutoffSec*1000, nowMs);
-    return { data: d3, src: 'Binance REST (gap fallback)' };
-  } catch(e3) {
-    return { data: [], src: 'gap failed' };
-  }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  YAHOO FINANCE  (stocks via CORS proxy chain)
-// ═══════════════════════════════════════════════════════════
-async function fetchYahooUrl(yUrl) {
-  return proxyFetch(yUrl);
-}
-
-async function fetchYahooHist(symbol, interval, cutoffSec) {
-  var iv    = IV_YAHOO[interval]    || '60m';
-  var range = YAHOO_RANGE[interval] || '60d';
-  var yUrl  = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
-    encodeURIComponent(symbol) + '?interval=' + iv + '&range=' + range + '&includePrePost=false';
-  var res     = await withRetry(function(){ return fetchYahooUrl(yUrl); }, 2);
-  var json    = await res.json();
-  var candles = parseYahoo(json, null, cutoffSec);
-  if (interval === '4h') candles = aggregateTo4h(candles);
-  return candles;
-}
-
-async function fetchYahooRecent(symbol, interval, cutoffSec) {
-  var iv   = IV_YAHOO[interval] || '60m';
-  var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' +
-    encodeURIComponent(symbol) + '?interval=' + iv + '&range=1d&includePrePost=false';
-  var res     = await withRetry(function(){ return fetchYahooUrl(yUrl); }, 2);
-  var json    = await res.json();
-  var candles = parseYahoo(json, cutoffSec, null);
-  if (interval === '4h') candles = aggregateTo4h(candles);
-  return candles;
-}
-
-function parseYahoo(json, sinceSec, cutoffSec) {
-  var result = json && json.chart && json.chart.result && json.chart.result[0];
-  if (!result) throw new Error('Yahoo: empty result');
-  var ts = result.timestamp, q = result.indicators.quote[0], out = [];
-  for (var i = 0; i < ts.length; i++) {
-    if (q.close[i]==null||q.open[i]==null) continue;
-    if (cutoffSec!=null && ts[i]>cutoffSec) continue;
-    if (sinceSec !=null && ts[i]<=sinceSec)  continue;
-    out.push({ time:ts[i], open:q.open[i], high:q.high[i], low:q.low[i], close:q.close[i], volume:q.volume[i]||0 });
+function calcEMA(candles, period) {
+  if (candles.length < period) return [];
+  var k = 2 / (period + 1), sum = 0;
+  for (var i = 0; i < period; i++) sum += candles[i].close;
+  var ema = sum / period;
+  var out = [{ time: candles[period-1].time, value: ema }];
+  for (var i = period; i < candles.length; i++) {
+    ema = candles[i].close * k + ema * (1 - k);
+    out.push({ time: candles[i].time, value: ema });
   }
   return out;
 }
 
-function aggregateTo4h(candles) {
-  var S4H = 4*3600, map = new Map();
-  candles.forEach(function(c) {
-    var b = Math.floor(c.time/S4H)*S4H;
-    if (!map.has(b)) { map.set(b,{time:b,open:c.open,high:c.high,low:c.low,close:c.close,volume:c.volume}); }
-    else { var x=map.get(b); if(c.high>x.high)x.high=c.high; if(c.low<x.low)x.low=c.low; x.close=c.close; x.volume+=c.volume; }
-  });
-  return Array.from(map.values()).sort(function(a,b){return a.time-b.time;});
+function calcRSI(candles, period) {
+  if (candles.length <= period) return [];
+  var ag = 0, al = 0;
+  for (var i = 1; i <= period; i++) {
+    var d = candles[i].close - candles[i-1].close;
+    if (d > 0) ag += d; else al -= d;
+  }
+  ag /= period; al /= period;
+  function toRSI(ag, al) { return al === 0 ? 100 : 100 - 100 / (1 + ag / al); }
+  var out = [{ time: candles[period].time, value: toRSI(ag, al) }];
+  for (var i = period + 1; i < candles.length; i++) {
+    var d = candles[i].close - candles[i-1].close;
+    ag = (ag * (period-1) + Math.max(d,0)) / period;
+    al = (al * (period-1) + Math.max(-d,0)) / period;
+    out.push({ time: candles[i].time, value: toRSI(ag, al) });
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MERGE
+//  CACHE
 // ═══════════════════════════════════════════════════════════
-function merge(primary, fill) {
-  var map = new Map();
-  primary.forEach(function(c){ map.set(c.time,c); });
-  fill.forEach(function(c){ map.set(c.time,c); });
-  return Array.from(map.values()).sort(function(a,b){return a.time-b.time;});
+function cacheKey(s, iv) { return 'chart_'+s+'_'+iv; }
+function saveCache(s, iv, d) { try { localStorage.setItem(cacheKey(s,iv), JSON.stringify({ts:Date.now(),d:d})); } catch(e){} }
+function loadCache(s, iv) {
+  try { var o=JSON.parse(localStorage.getItem(cacheKey(s,iv))); return o&&(Date.now()-o.ts<CACHE_TTL)?o.d:null; } catch(e){ return null; }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FETCH HELPERS
+// ═══════════════════════════════════════════════════════════
+function isCrypto(raw) {
+  var s=raw.toUpperCase().replace(/[\s\/\-_]/g,'');
+  if (/^(EURUSD|GBPUSD|USDJPY|AUDUSD|USDCHF|NZDUSD|USDCAD)/.test(s)) return false;
+  return /^[A-Z0-9]+(USDT|USDC|BUSD|BTC|ETH|BNB)$/.test(s);
+}
+function normalizeBinance(raw) { return raw.toUpperCase().replace(/[\s\/\-_]/g,''); }
+
+async function proxyFetch(url) {
+  var last;
+  for (var i=0; i<CORS_PROXIES.length; i++) {
+    try { var r=await fetch(CORS_PROXIES[i]+encodeURIComponent(url)); if(r.ok) return r; last=new Error('proxy'+i+' '+r.status); }
+    catch(e){ last=e; }
+  }
+  throw last||new Error('all proxies failed');
+}
+
+async function withRetry(fn, n) {
+  var d=400;
+  for (var i=0; i<=n; i++) {
+    try { return await fn(); } catch(e) { if(i===n) throw e; await new Promise(function(r){setTimeout(r,d);}); d=Math.min(d*2,8000); }
+  }
+}
+
+// Binance (paginated)
+async function fetchBinanceBatch(sym,iv,s,e) {
+  var r=await fetch('https://api.binance.com/api/v3/klines?symbol='+sym+'&interval='+iv+'&startTime='+s+'&endTime='+e+'&limit=1000');
+  if(!r.ok) throw new Error('Binance '+r.status);
+  var rows=await r.json();
+  return rows.map(function(k){return{time:Math.floor(k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5]};});
+}
+async function fetchBinanceHist(sym,interval,startMs,endMs) {
+  var iv=IV_BINANCE[interval]||'1h', all=[], end=endMs;
+  while(end>startMs){
+    var b=await withRetry(function(){return fetchBinanceBatch(sym,iv,startMs,end);},2);
+    if(!b.length) break;
+    all=b.concat(all); if(b.length<1000) break; end=b[0].time*1000-1;
+  }
+  var m=new Map(); all.forEach(function(c){m.set(c.time,c);}); return Array.from(m.values()).sort(function(a,b){return a.time-b.time;});
+}
+
+// Bybit
+async function fetchBybitBatch(sym,iv,s,e) {
+  var r=await fetch('https://api.bybit.com/v5/market/kline?category=spot&symbol='+sym+'&interval='+iv+'&start='+s+'&end='+e+'&limit=1000');
+  if(!r.ok) throw new Error('Bybit '+r.status);
+  var j=await r.json(); if(j.retCode!==0) throw new Error('Bybit '+j.retMsg);
+  return j.result.list.map(function(k){return{time:Math.floor(+k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5]};}).reverse();
+}
+async function fetchBybitHist(sym,interval,startMs,endMs) {
+  var iv=IV_BYBIT[interval]||'60', all=[], end=endMs;
+  while(end>startMs){
+    var b=await withRetry(function(){return fetchBybitBatch(sym,iv,startMs,end);},2);
+    if(!b.length) break;
+    all=b.concat(all); if(b.length<1000) break; end=b[0].time*1000-1;
+  }
+  var m=new Map(); all.forEach(function(c){m.set(c.time,c);}); return Array.from(m.values()).sort(function(a,b){return a.time-b.time;});
+}
+
+// Kraken gap fill
+async function fetchKrakenGap(sym,interval,sinceSec) {
+  var pair=KRAKEN_MAP[sym]; if(!pair) throw new Error('no Kraken pair for '+sym);
+  var r=await withRetry(function(){return fetch('https://api.kraken.com/0/public/OHLC?pair='+pair+'&interval='+(IV_KRAKEN[interval]||60)+'&since='+sinceSec);},2);
+  if(!r.ok) throw new Error('Kraken '+r.status);
+  var j=await r.json(); if(j.error&&j.error.length) throw new Error(j.error[0]);
+  var key=Object.keys(j.result).find(function(k){return k!=='last';});
+  return (j.result[key]||[]).map(function(k){return{time:+k[0],open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[6]};});
+}
+
+// Crypto orchestrators
+async function fetchCryptoHist(sym,interval,startMs,endMs) {
+  try { var d=await fetchBinanceHist(sym,interval,startMs,endMs); return{data:d,src:'Binance REST'}; }
+  catch(e1) {
+    try { var d2=await fetchBybitHist(sym,interval,startMs,endMs); return{data:d2,src:'Bybit REST (fallback)'}; }
+    catch(e2) { throw new Error('Binance: '+e1.message+' | Bybit: '+e2.message); }
+  }
+}
+async function fetchCryptoGap(sym,interval,cutoffSec,nowMs) {
+  try { return{data:await fetchKrakenGap(sym,interval,cutoffSec),src:'Kraken REST'}; } catch(e){}
+  try { return{data:await fetchBybitBatch(sym,IV_BYBIT[interval]||'60',cutoffSec*1000,nowMs),src:'Bybit (gap fallback)'}; } catch(e){}
+  try { return{data:await fetchBinanceBatch(sym,IV_BINANCE[interval]||'1h',cutoffSec*1000,nowMs),src:'Binance (gap fallback)'}; } catch(e){}
+  return{data:[],src:'gap failed'};
+}
+
+// Yahoo
+function parseYahoo(json,sinceSec,cutoffSec) {
+  var res=json&&json.chart&&json.chart.result&&json.chart.result[0]; if(!res) throw new Error('Yahoo empty');
+  var ts=res.timestamp,q=res.indicators.quote[0],out=[];
+  for(var i=0;i<ts.length;i++){
+    if(q.close[i]==null||q.open[i]==null) continue;
+    if(cutoffSec!=null&&ts[i]>cutoffSec) continue;
+    if(sinceSec !=null&&ts[i]<=sinceSec)  continue;
+    out.push({time:ts[i],open:q.open[i],high:q.high[i],low:q.low[i],close:q.close[i],volume:q.volume[i]||0});
+  }
+  return out;
+}
+function aggregateTo4h(c) {
+  var S=4*3600,m=new Map();
+  c.forEach(function(x){var b=Math.floor(x.time/S)*S; if(!m.has(b)){m.set(b,{time:b,open:x.open,high:x.high,low:x.low,close:x.close,volume:x.volume});}
+    else{var v=m.get(b);if(x.high>v.high)v.high=x.high;if(x.low<v.low)v.low=x.low;v.close=x.close;v.volume+=x.volume;}});
+  return Array.from(m.values()).sort(function(a,b){return a.time-b.time;});
+}
+async function fetchYahooHist(sym,interval,cutoffSec) {
+  var url='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(sym)+'?interval='+(IV_YAHOO[interval]||'60m')+'&range='+(YAHOO_RANGE[interval]||'60d')+'&includePrePost=false';
+  var r=await withRetry(function(){return proxyFetch(url);},2);
+  var c=parseYahoo(await r.json(),null,cutoffSec);
+  return interval==='4h'?aggregateTo4h(c):c;
+}
+async function fetchYahooRecent(sym,interval,cutoffSec) {
+  var url='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(sym)+'?interval='+(IV_YAHOO[interval]||'60m')+'&range=1d&includePrePost=false';
+  var r=await withRetry(function(){return proxyFetch(url);},2);
+  var c=parseYahoo(await r.json(),cutoffSec,null);
+  return interval==='4h'?aggregateTo4h(c):c;
+}
+
+function merge(a,b) {
+  var m=new Map(); a.forEach(function(c){m.set(c.time,c);}); b.forEach(function(c){m.set(c.time,c);});
+  return Array.from(m.values()).sort(function(a,b){return a.time-b.time;});
 }
 
 // ═══════════════════════════════════════════════════════════
 //  CHART STATE
 // ═══════════════════════════════════════════════════════════
-var chart, candleSeries, volumeSeries, ws, stockPoller;
+var mainChart, candleSeries, volumeSeries, ema20Series, ema50Series;
+var rsiChart, rsiSeries;
+var ws, stockPoller;
+// Live indicator state (updated on each WebSocket tick)
+var liveEMA20=null, liveEMA50=null;
+var liveAvgGain=null, liveAvgLoss=null, livePrevClose=null;
+var indVisible = { ema20:true, ema50:true, rsi:true };
 
 // ═══════════════════════════════════════════════════════════
 //  CHART INIT
 // ═══════════════════════════════════════════════════════════
-function initChart() {
-  var el = document.getElementById('chart');
-  chart = LightweightCharts.createChart(el, {
-    layout:{ background:{ color:'#131722' }, textColor:'#d1d4dc' },
-    grid:{ vertLines:{ color:'#1e222d' }, horzLines:{ color:'#1e222d' } },
+function chartOpts(height) {
+  return {
+    layout:{ background:{color:'#131722'}, textColor:'#d1d4dc' },
+    grid:{ vertLines:{color:'#1e222d'}, horzLines:{color:'#1e222d'} },
     crosshair:{ mode:LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale:{ borderColor:'#2a2e39', scaleMargins:{ top:0.05, bottom:0.25 } },
+    rightPriceScale:{ borderColor:'#2a2e39' },
     timeScale:{ borderColor:'#2a2e39', timeVisible:true, secondsVisible:false },
-  });
-  candleSeries = chart.addCandlestickSeries({
-    upColor:'#26a69a',downColor:'#ef5350',borderVisible:false,
-    wickUpColor:'#26a69a',wickDownColor:'#ef5350',
-  });
-  volumeSeries = chart.addHistogramSeries({ priceFormat:{type:'volume'}, priceScaleId:'vol' });
-  volumeSeries.priceScale().applyOptions({ scaleMargins:{ top:0.78, bottom:0 } });
+  };
+}
 
-  chart.subscribeCrosshairMove(function(param) {
+function initChart() {
+  var elMain = document.getElementById('chartMain');
+  var elRsi  = document.getElementById('chartRsi');
+
+  // Main chart
+  mainChart = LightweightCharts.createChart(elMain, chartOpts());
+  mainChart.applyOptions({ rightPriceScale:{ scaleMargins:{top:0.05,bottom:0.25} } });
+
+  candleSeries = mainChart.addCandlestickSeries({
+    upColor:'#26a69a', downColor:'#ef5350', borderVisible:false,
+    wickUpColor:'#26a69a', wickDownColor:'#ef5350',
+  });
+  volumeSeries = mainChart.addHistogramSeries({ priceFormat:{type:'volume'}, priceScaleId:'vol' });
+  volumeSeries.priceScale().applyOptions({ scaleMargins:{top:0.78,bottom:0} });
+
+  ema20Series = mainChart.addLineSeries({ color:'#b2b5be', lineWidth:1, priceLineVisible:false, lastValueVisible:false });
+  ema50Series = mainChart.addLineSeries({ color:'#f9a825', lineWidth:1, priceLineVisible:false, lastValueVisible:false });
+
+  // RSI chart
+  rsiChart = LightweightCharts.createChart(elRsi, chartOpts());
+  rsiChart.applyOptions({ timeScale:{ visible:false } });  // hide RSI time axis (shared with main)
+
+  rsiSeries = rsiChart.addLineSeries({
+    color:'#7b61ff', lineWidth:1, priceLineVisible:false, lastValueVisible:true,
+    autoscaleInfoProvider: function() { return { priceRange:{ minValue:0, maxValue:100 } }; }
+  });
+  rsiSeries.createPriceLine({ price:70, color:'#ef5350', lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dashed, title:'' });
+  rsiSeries.createPriceLine({ price:30, color:'#26a69a', lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dashed, title:'' });
+  rsiSeries.createPriceLine({ price:50, color:'#4c5058', lineWidth:1, lineStyle:LightweightCharts.LineStyle.Dotted, title:'' });
+
+  // Sync time scale scroll/zoom between both charts
+  var syncing = false;
+  mainChart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+    if (syncing||!range) return; syncing=true; rsiChart.timeScale().setVisibleLogicalRange(range); syncing=false;
+  });
+  rsiChart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+    if (syncing||!range) return; syncing=true; mainChart.timeScale().setVisibleLogicalRange(range); syncing=false;
+  });
+
+  // OHLC + EMA tooltip
+  mainChart.subscribeCrosshairMove(function(param) {
     var ov = document.getElementById('ohlcOverlay');
     if (!param.time) { ov.style.display='none'; return; }
-    var c = param.seriesData.get(candleSeries);
-    if (!c) { ov.style.display='none'; return; }
+    var c = param.seriesData.get(candleSeries); if (!c) { ov.style.display='none'; return; }
     var cls = c.close>=c.open?'up':'down';
+    var e20 = param.seriesData.get(ema20Series), e50 = param.seriesData.get(ema50Series);
     ov.style.display='block';
-    ov.innerHTML='O&nbsp;<span class="'+cls+'">'+fmt(c.open)+'</span>&ensp;'+
-      'H&nbsp;<span class="'+cls+'">'+fmt(c.high)+'</span>&ensp;'+
-      'L&nbsp;<span class="'+cls+'">'+fmt(c.low)+'</span>&ensp;'+
-      'C&nbsp;<span class="'+cls+'">'+fmt(c.close)+'</span>';
+    ov.innerHTML =
+      'O<span class="'+cls+'"> '+fmt(c.open)+'</span>  '+
+      'H<span class="'+cls+'"> '+fmt(c.high)+'</span>  '+
+      'L<span class="'+cls+'"> '+fmt(c.low)+'</span>  '+
+      'C<span class="'+cls+'"> '+fmt(c.close)+'</span>' +
+      (e20&&indVisible.ema20?'  <span style="color:#b2b5be">EMA20 '+fmt(e20.value)+'</span>':'') +
+      (e50&&indVisible.ema50?'  <span style="color:#f9a825">EMA50 '+fmt(e50.value)+'</span>':'');
   });
-  new ResizeObserver(function(){ chart.applyOptions({ width:el.clientWidth, height:el.clientHeight }); }).observe(el);
-  chart.applyOptions({ width:el.clientWidth, height:el.clientHeight });
+
+  // RSI value overlay
+  rsiChart.subscribeCrosshairMove(function(param) {
+    if (!param.time) return;
+    var r = param.seriesData.get(rsiSeries); if (!r) return;
+    var v = r.value, el = document.getElementById('rsiValue');
+    el.style.color = v>70?'#ef5350':v<30?'#26a69a':'#7b61ff';
+    el.textContent = v.toFixed(1);
+  });
+
+  // Resize both charts together
+  var roMain = new ResizeObserver(function() {
+    mainChart.applyOptions({ width:elMain.clientWidth, height:elMain.clientHeight });
+  });
+  roMain.observe(elMain);
+  var roRsi = new ResizeObserver(function() {
+    rsiChart.applyOptions({ width:elRsi.clientWidth, height:elRsi.clientHeight });
+  });
+  roRsi.observe(elRsi);
+
+  mainChart.applyOptions({ width:elMain.clientWidth, height:elMain.clientHeight });
+  rsiChart.applyOptions({ width:elRsi.clientWidth, height:elRsi.clientHeight });
 }
 
 function fmt(n) { return n>=1000?n.toFixed(2):n>=1?n.toFixed(4):n.toFixed(6); }
 
+// ═══════════════════════════════════════════════════════════
+//  INDICATOR TOGGLE
+// ═══════════════════════════════════════════════════════════
+function toggleIndicator(name) {
+  indVisible[name] = !indVisible[name];
+  document.getElementById('btn'+name.charAt(0).toUpperCase()+name.slice(1))
+    .classList.toggle('active', indVisible[name]);
+  if (name==='ema20') ema20Series.applyOptions({ visible:indVisible.ema20 });
+  if (name==='ema50') ema50Series.applyOptions({ visible:indVisible.ema50 });
+  if (name==='rsi') {
+    document.getElementById('rsiWrap').style.display = indVisible.rsi ? '' : 'none';
+    document.getElementById('chartRsi').style.display = indVisible.rsi ? '' : 'none';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  PRICE DISPLAY
+// ═══════════════════════════════════════════════════════════
 function setPrice(candles) {
   if (!candles.length) return;
   var last=candles[candles.length-1], first=candles[0];
   var cls=last.close>=last.open?'up':'down';
   document.getElementById('priceDisplay').innerHTML='<span class="'+cls+'">'+fmt(last.close)+'</span>';
   var chg=(last.close-first.open)/first.open*100;
-  document.getElementById('changeDisplay').innerHTML=
-    '<span class="'+(chg>=0?'up':'down')+'">'+(chg>=0?'+':'')+chg.toFixed(2)+'%</span>';
+  document.getElementById('changeDisplay').innerHTML='<span class="'+(chg>=0?'up':'down')+'">'+(chg>=0?'+':'')+chg.toFixed(2)+'%</span>';
 }
 
+// ═══════════════════════════════════════════════════════════
+//  LIVE CANDLE UPDATE  (WebSocket + incremental indicators)
+// ═══════════════════════════════════════════════════════════
 function updateLiveCandle(c) {
   candleSeries.update({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close});
   if (c.volume!=null) volumeSeries.update({time:c.time,value:c.volume,color:c.close>=c.open?'rgba(38,166,154,0.5)':'rgba(239,83,80,0.5)'});
+
+  // EMA incremental update
+  var k20=2/(EMA_FAST+1), k50=2/(EMA_SLOW+1);
+  if (liveEMA20!==null) { liveEMA20=c.close*k20+liveEMA20*(1-k20); ema20Series.update({time:c.time,value:liveEMA20}); }
+  if (liveEMA50!==null) { liveEMA50=c.close*k50+liveEMA50*(1-k50); ema50Series.update({time:c.time,value:liveEMA50}); }
+
+  // RSI incremental update (Wilder's smoothing)
+  if (livePrevClose!==null&&liveAvgGain!==null) {
+    var d=c.close-livePrevClose;
+    liveAvgGain=(liveAvgGain*(RSI_PER-1)+Math.max(d,0))/RSI_PER;
+    liveAvgLoss=(liveAvgLoss*(RSI_PER-1)+Math.max(-d,0))/RSI_PER;
+    var rv=liveAvgLoss===0?100:100-100/(1+liveAvgGain/liveAvgLoss);
+    rsiSeries.update({time:c.time,value:rv});
+    var el=document.getElementById('rsiValue');
+    el.style.color=rv>70?'#ef5350':rv<30?'#26a69a':'#7b61ff';
+    el.textContent=rv.toFixed(1);
+  }
+  livePrevClose=c.close;
+
   var cls=c.close>=c.open?'up':'down';
   document.getElementById('priceDisplay').innerHTML='<span class="'+cls+'">'+fmt(c.close)+'</span>';
   document.getElementById('sTime').textContent='Updated '+new Date().toLocaleTimeString();
 }
 
 // ═══════════════════════════════════════════════════════════
-//  LIVE — BINANCE WEBSOCKET
+//  RENDER (candles + indicators)
 // ═══════════════════════════════════════════════════════════
-function connectBinanceWS(symbol, interval) {
-  stopLive();
-  var stream = symbol.toLowerCase()+'@kline_'+(IV_BINANCE[interval]||'1h');
-  ws = new WebSocket('wss://stream.binance.com:9443/ws/'+stream);
-  ws.onopen   = function(){ setS('sLive','<span class="ok">Binance WS &#9679; live</span>'); };
-  ws.onmessage= function(e){ var k=JSON.parse(e.data).k; updateLiveCandle({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c,volume:+k.v}); };
-  ws.onclose  = function(){ setS('sLive','<span class="warn">WS reconnecting&hellip;</span>'); setTimeout(function(){connectBinanceWS(symbol,interval);},3000); };
-  ws.onerror  = function(){ ws.close(); };
+function renderCandles(merged) {
+  candleSeries.setData(merged.map(function(c){return{time:c.time,open:c.open,high:c.high,low:c.low,close:c.close};}));
+  volumeSeries.setData(merged.map(function(c){return{time:c.time,value:c.volume,color:c.close>=c.open?'rgba(38,166,154,0.5)':'rgba(239,83,80,0.5)'};}));
+
+  // Compute and render indicators
+  var ema20data = calcEMA(merged, EMA_FAST);
+  var ema50data = calcEMA(merged, EMA_SLOW);
+  var rsiData   = calcRSI(merged, RSI_PER);
+
+  ema20Series.setData(ema20data);
+  ema50Series.setData(ema50data);
+  rsiSeries.setData(rsiData);
+
+  // Seed live state from last computed values
+  if (ema20data.length) liveEMA20 = ema20data[ema20data.length-1].value;
+  if (ema50data.length) liveEMA50 = ema50data[ema50data.length-1].value;
+  if (rsiData.length) {
+    // Back-calculate avg gain/loss from last RSI so live updates are accurate
+    // Approximate: use last N changes to estimate avgGain/avgLoss
+    var n = Math.min(RSI_PER*2, merged.length-1), ag=0, al=0;
+    for (var i=merged.length-n; i<merged.length; i++) {
+      var d=merged[i].close-merged[i-1].close;
+      ag+=(d>0?d:0); al+=(d<0?-d:0);
+    }
+    liveAvgGain=ag/n; liveAvgLoss=al/n;
+    livePrevClose=merged[merged.length-1].close;
+    var lastRSI=rsiData[rsiData.length-1].value;
+    var el=document.getElementById('rsiValue');
+    el.style.color=lastRSI>70?'#ef5350':lastRSI<30?'#26a69a':'#7b61ff';
+    el.textContent=lastRSI.toFixed(1);
+  }
+
+  mainChart.timeScale().fitContent();
+  setPrice(merged);
+  document.getElementById('sTime').textContent='Loaded '+new Date().toLocaleTimeString();
 }
 
 // ═══════════════════════════════════════════════════════════
-//  LIVE — YAHOO POLL (stocks)
+//  LIVE CONNECTIONS
 // ═══════════════════════════════════════════════════════════
+function connectBinanceWS(symbol, interval) {
+  stopLive();
+  var stream=symbol.toLowerCase()+'@kline_'+(IV_BINANCE[interval]||'1h');
+  ws=new WebSocket('wss://stream.binance.com:9443/ws/'+stream);
+  ws.onopen=function(){ setS('sLive','<span class="ok">Binance WS &#9679; live</span>'); };
+  ws.onmessage=function(e){ var k=JSON.parse(e.data).k; updateLiveCandle({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c,volume:+k.v}); };
+  ws.onclose=function(){ setS('sLive','<span class="warn">WS reconnecting&hellip;</span>'); setTimeout(function(){connectBinanceWS(symbol,interval);},3000); };
+  ws.onerror=function(){ ws.close(); };
+}
+
 function startYahooPoll(symbol, interval) {
   stopLive();
-  var iv = IV_YAHOO[interval]||'60m';
+  var iv=IV_YAHOO[interval]||'60m';
   function poll() {
-    var yUrl='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(symbol)+'?interval='+iv+'&range=1d&includePrePost=false';
-    fetchYahooUrl(yUrl).then(function(r){return r.json();}).then(function(json){
-      var result=json&&json.chart&&json.chart.result&&json.chart.result[0]; if(!result)return;
-      var ts=result.timestamp,q=result.indicators.quote[0]; if(!ts||!ts.length)return;
-      var i=ts.length-1; while(i>=0&&q.close[i]==null)i--; if(i<0)return;
+    var url='https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(symbol)+'?interval='+iv+'&range=1d&includePrePost=false';
+    proxyFetch(url).then(function(r){return r.json();}).then(function(json){
+      var res=json&&json.chart&&json.chart.result&&json.chart.result[0]; if(!res) return;
+      var ts=res.timestamp,q=res.indicators.quote[0]; if(!ts||!ts.length) return;
+      var i=ts.length-1; while(i>=0&&q.close[i]==null)i--; if(i<0) return;
       updateLiveCandle({time:ts[i],open:q.open[i],high:q.high[i],low:q.low[i],close:q.close[i],volume:q.volume[i]||0});
       setS('sLive','<span class="ok">Yahoo poll &#10003;</span>');
-    }).catch(function(e){ setS('sLive','<span class="err">Poll: '+e.message+'</span>'); });
+    }).catch(function(e){ setS('sLive','<span class="err">'+e.message+'</span>'); });
   }
   poll(); stockPoller=setInterval(poll,30000);
   setS('sLive','<span class="warn">Yahoo poll 30s</span>');
@@ -498,6 +558,8 @@ function startYahooPoll(symbol, interval) {
 function stopLive() {
   if(ws){try{ws.close();}catch(e){}ws=null;}
   if(stockPoller){clearInterval(stockPoller);stockPoller=null;}
+  // Reset live indicator state
+  liveEMA20=liveEMA50=liveAvgGain=liveAvgLoss=livePrevClose=null;
 }
 
 function setS(id,html){ document.getElementById(id).innerHTML=html; }
@@ -506,107 +568,60 @@ function setS(id,html){ document.getElementById(id).innerHTML=html; }
 //  MAIN LOAD
 // ═══════════════════════════════════════════════════════════
 async function loadChart() {
-  var rawSymbol = document.getElementById('symbolInput').value.trim();
-  var interval  = document.getElementById('intervalSelect').value;
-  if (!rawSymbol) return;
+  var rawSym  = document.getElementById('symbolInput').value.trim();
+  var interval= document.getElementById('intervalSelect').value;
+  if (!rawSym) return;
 
   stopLive();
-  setS('s1','loading&hellip;'); setS('s2','loading&hellip;');
-  setS('sLive','&mdash;');
+  setS('s1','loading&hellip;'); setS('s2','loading&hellip;'); setS('sLive','&mdash;');
   document.getElementById('priceDisplay').textContent='—';
   document.getElementById('changeDisplay').textContent='';
+  document.getElementById('rsiValue').textContent='—';
 
-  var nBars     = HIST_BARS[interval]||500;
-  var now       = Date.now();
-  var cutoffMs  = now - LAG_MIN*60*1000;
-  var cutoffSec = Math.floor(cutoffMs/1000);
-  var startMs   = cutoffMs - nBars*(IV_MS[interval]||3600e3);
-
+  var nBars=HIST_BARS[interval]||500, now=Date.now();
+  var cutoffMs=now-LAG_MIN*60*1000, cutoffSec=Math.floor(cutoffMs/1000);
+  var startMs=cutoffMs-nBars*(IV_MS[interval]||3600e3);
   var hist=[], gap=[];
 
-  if (isCrypto(rawSymbol)) {
-    var symbol = normalizeBinance(rawSymbol);
-    document.getElementById('symbolInput').value = symbol;
+  if (isCrypto(rawSym)) {
+    var sym=normalizeBinance(rawSym);
+    document.getElementById('symbolInput').value=sym;
 
-    // Check localStorage cache first
-    var cached = loadCache(symbol, interval);
+    var cached=loadCache(sym,interval);
     if (cached) {
       renderCandles(cached);
       setS('s1','<span class="cache">&#9679; cache ('+cached.length+' bars)</span>');
-      setS('s2','<span class="cache">served from cache</span>');
-      connectBinanceWS(symbol, interval);
-      return;
+      setS('s2','<span class="cache">from cache</span>');
+      connectBinanceWS(sym,interval); return;
     }
 
-    // Source 1: Binance → Bybit fallback
-    try {
-      var r1 = await fetchCryptoHist(symbol, interval, startMs, cutoffMs);
-      hist   = r1.data;
-      setS('s1','<span class="ok">'+r1.src+' ('+hist.length+' bars)</span>');
-    } catch(e) {
-      setS('s1','<span class="err">Hist failed: '+e.message+'</span>');
-    }
+    try { var r1=await fetchCryptoHist(sym,interval,startMs,cutoffMs); hist=r1.data; setS('s1','<span class="ok">'+r1.src+' ('+hist.length+')</span>'); }
+    catch(e){ setS('s1','<span class="err">'+e.message+'</span>'); }
 
-    // Source 2: Kraken → Bybit → Binance fallback
-    var r2 = await fetchCryptoGap(symbol, interval, cutoffSec, now);
-    gap    = r2.data;
-    var gapClass = r2.src.includes('failed') ? 'err' : r2.src.includes('fallback') ? 'warn' : 'ok';
-    setS('s2','<span class="'+gapClass+'">'+r2.src+' ('+gap.length+' bars)</span>');
+    var r2=await fetchCryptoGap(sym,interval,cutoffSec,now); gap=r2.data;
+    setS('s2','<span class="'+(r2.src.includes('failed')?'err':r2.src.includes('fallback')?'warn':'ok')+'">'+r2.src+' ('+gap.length+')</span>');
 
-    var merged = merge(hist, gap);
-    saveCache(symbol, interval, merged);
-    renderCandles(merged);
-    connectBinanceWS(symbol, interval);
-
+    var merged=merge(hist,gap); saveCache(sym,interval,merged); renderCandles(merged); connectBinanceWS(sym,interval);
   } else {
-    // Stocks: check cache
-    var cachedS = loadCache(rawSymbol, interval);
-    if (cachedS) {
-      renderCandles(cachedS);
-      setS('s1','<span class="cache">&#9679; cache ('+cachedS.length+' bars)</span>');
-      setS('s2','<span class="cache">served from cache</span>');
-      startYahooPoll(rawSymbol, interval);
-      return;
+    var cached2=loadCache(rawSym,interval);
+    if (cached2) {
+      renderCandles(cached2);
+      setS('s1','<span class="cache">&#9679; cache ('+cached2.length+' bars)</span>');
+      setS('s2','<span class="cache">from cache</span>');
+      startYahooPoll(rawSym,interval); return;
     }
 
-    // Source 1: Yahoo Finance (CORS proxy chain)
-    try {
-      hist = await fetchYahooHist(rawSymbol, interval, cutoffSec);
-      var lbl = interval==='4h'?' (agg 1h→4h)':'';
-      setS('s1','<span class="ok">Yahoo Finance ('+hist.length+' bars'+lbl+')</span>');
-    } catch(e) {
-      setS('s1','<span class="err">Yahoo hist: '+e.message+'</span>');
-    }
+    try { hist=await fetchYahooHist(rawSym,interval,cutoffSec); setS('s1','<span class="ok">Yahoo ('+hist.length+(interval==='4h'?' agg→4h':'')+' bars)</span>'); }
+    catch(e){ setS('s1','<span class="err">Yahoo: '+e.message+'</span>'); }
 
-    // Source 2: Yahoo Finance recent
-    try {
-      gap = await fetchYahooRecent(rawSymbol, interval, cutoffSec);
-      setS('s2','<span class="ok">Yahoo Finance gap ('+gap.length+' bars)</span>');
-    } catch(e) {
-      setS('s2','<span class="err">Yahoo gap: '+e.message+'</span>');
-    }
+    try { gap=await fetchYahooRecent(rawSym,interval,cutoffSec); setS('s2','<span class="ok">Yahoo gap ('+gap.length+')</span>'); }
+    catch(e){ setS('s2','<span class="err">gap: '+e.message+'</span>'); }
 
-    var mergedS = merge(hist, gap);
-    saveCache(rawSymbol, interval, mergedS);
-    renderCandles(mergedS);
-    startYahooPoll(rawSymbol, interval);
+    var mergedS=merge(hist,gap); saveCache(rawSym,interval,mergedS); renderCandles(mergedS); startYahooPoll(rawSym,interval);
   }
 }
 
-function renderCandles(merged) {
-  candleSeries.setData(merged.map(function(c){
-    return {time:c.time,open:c.open,high:c.high,low:c.low,close:c.close};
-  }));
-  volumeSeries.setData(merged.map(function(c){
-    return {time:c.time,value:c.volume,color:c.close>=c.open?'rgba(38,166,154,0.5)':'rgba(239,83,80,0.5)'};
-  }));
-  chart.timeScale().fitContent();
-  setPrice(merged);
-  document.getElementById('sTime').textContent='Loaded '+new Date().toLocaleTimeString();
-}
-
 document.getElementById('symbolInput').addEventListener('keydown',function(e){ if(e.key==='Enter') loadChart(); });
-
 initChart();
 loadChart();
 </script>
